@@ -4,9 +4,11 @@ import random
 import sys
 import time
 import yaml
+from collections import deque
 
 import numpy as np
 import torch
+import wandb
 
 from baselines import logger
 
@@ -16,7 +18,9 @@ from dcpg.models import *
 from dcpg.sample_utils import sample_episodes
 from dcpg.storages import RolloutStorage
 from dcpg.rnd import RandomNetworkDistillationState, RandomNetworkDistillationStateAction
-from test import evaluate
+from test import evaluate, evaluate_pure_start, render_obs
+
+from expgen.PPO_maxEnt_LEEP.model import Policy, ImpalaModel
 
 DEBUG = False
 
@@ -50,7 +54,7 @@ def main(config):
     # )
     logger.configure(
         dir=config["log_dir"], format_strs=["csv", "wandb"], log_suffix=log_file,
-        project_name=config['project_name'], model_name=config['env_name'] + " - " + config['model_name'], args=config,
+        project_name=config['project_name'], model_name=config['env_name'] + " - " + config['model_name'], wandb_dir=config['wandb_dir'], args=config,
     )
     print("\nLog File:", log_file)
 
@@ -77,10 +81,22 @@ def main(config):
     print("\nActor-Critic Network:", actor_critic)
 
     # Create pure exploration actor-critic
-    pure_actor_critic = actor_critic_class(
-        obs_space.shape, action_space.n, **actor_critic_params
+    recurrent_hidden_size = int(256)
+    gray_scale = False
+    epsilon_RPO = 0
+
+    pure_actor_critic = Policy(
+        obs_space.shape,
+        action_space,
+        base=ImpalaModel,
+        base_kwargs={'recurrent': True,
+                        'hidden_size': recurrent_hidden_size, 'gray_scale': gray_scale},
+        epsilon_RPO=epsilon_RPO
     )
     pure_actor_critic.to(device)
+
+    pure_actor_critic_weights = torch.load(f"models/{config['env_name']}-expgen.pt")
+    pure_actor_critic.load_state_dict(pure_actor_critic_weights['state_dict'])
     print("\nPure Exploration Actor-Critic Network:", pure_actor_critic)
 
     # Create rollout storage
@@ -89,58 +105,18 @@ def main(config):
     )
     rollouts.to(device)
 
-    # Create pure exploration rollout storage
-    pure_rollouts = RolloutStorage(
-        config["num_steps"], config["num_processes"], obs_space.shape, action_space
-    )
-    pure_rollouts.to(device)
-
     # Create agent
     agent_class = getattr(sys.modules[__name__], config["agent_class"])
     agent_params = config["agent_params"]
     agent = agent_class(actor_critic, **agent_params, device=device)
 
-    # Create pure exploration agent
-    pure_agent = agent_class(pure_actor_critic, **agent_params, device=device)
-
-    # Create Random Network Distillation
-    config['rnd_embed_dim'] = 512
-    config['rnd_kwargs'] = dict(activation_fn = torch.nn.ReLU, net_arch=[1024], learning_rate=0.0001)
-    config['rnd_flatten_input'] = True
-    config['rnd_use_resnet'] = True
-    config['rnd_normalize_images'] = False
-    config['rnd_normalize_output'] = True
-    config['rnd_next_state'] = True
-
-    if config['rnd_next_state']:
-        rnd = RandomNetworkDistillationState(
-            envs.action_space,
-            envs.observation_space,
-            config['rnd_embed_dim'],
-            config['rnd_kwargs'],
-            device=device,
-            flatten_input=config['rnd_flatten_input'],
-            use_resnet=config['rnd_use_resnet'],
-            normalize_images=config['rnd_normalize_images'],
-            normalize_output=config['rnd_normalize_output'],
-            )
-    else:
-        rnd = RandomNetworkDistillationStateAction(
-            envs.action_space,
-            envs.observation_space,
-            config['rnd_embed_dim'],
-            config['rnd_kwargs'],
-            device=device,
-            flatten_input=config['rnd_flatten_input'],
-            use_resnet=config['rnd_use_resnet'],
-            normalize_images=config['rnd_normalize_images'],
-            normalize_output=config['rnd_normalize_output'],
-            )
-
     # Initialize environments
     obs = envs.reset()
     *_, infos = envs.step_wait()
     levels = torch.LongTensor([info["level_seed"] for info in infos]).to(device)
+    pure_masks = torch.ones(config['num_processes'], 1, device=device)
+    pure_recurrent_hidden_states = torch.zeros(config['num_processes'], pure_actor_critic.recurrent_hidden_state_size, device=device)
+
 
     # Train actor-critic
     num_env_steps_epoch = config["num_steps"] * config["num_processes"]
@@ -153,6 +129,9 @@ def main(config):
     episode_steps = np.zeros(config["num_processes"])
     num_normal_steps = 0
 
+    deque_max_len = 20
+    start_states_by_level = [deque(maxlen=deque_max_len) for _ in range(config["num_levels"])]
+
     for j in range(num_updates):
         # Start training
         start = time.time()
@@ -162,25 +141,20 @@ def main(config):
         pure_actor_critic.train()
 
         # Sample episode
-        normalise = False
-        if j < 10:
-            # normalise RND on the data of the first 10 rollouts
-            normalise = True
-        _, obs, levels, new_normal_steps = sample_episodes(
+        _, obs, pure_recurrent_hidden_states, pure_masks, levels, new_normal_steps = sample_episodes(
             envs, 
             rollouts, 
-            pure_rollouts, 
             obs, 
+            pure_recurrent_hidden_states,
+            pure_masks,
             levels, 
             pure_expl_steps_per_env, 
             episode_steps, 
             actor_critic, 
             pure_actor_critic, 
             num_pure_expl_steps, 
-            config['num_processes'], 
-            rnd, 
-            config['rnd_next_state'], 
-            normalise
+            config['num_processes'],
+            start_states_by_level
         )
         num_normal_steps += new_normal_steps
 
@@ -188,20 +162,33 @@ def main(config):
         rollouts.compute_returns(actor_critic, config["gamma"], config["gae_lambda"])
         rollouts.compute_advantages()
 
-        pure_rollouts.compute_returns(pure_actor_critic, config["gamma"], config["gae_lambda"])
-        pure_rollouts.compute_advantages()
-
         # Update actor-critic
         train_statistics = agent.update(rollouts)
-        pure_train_statistics = pure_agent.update(pure_rollouts)
 
         # Reset rollout storage
         rollouts.after_update()
-        pure_rollouts.after_update()
 
         # End training
         end = time.time()
         elapsed_time += end - start
+
+        if j % 200 == 199:
+            empty_levels = set()
+            for i, dq in enumerate(start_states_by_level):
+                if len(dq) == 0:
+                    empty_levels.add(i)
+            non_empty_levels = set(range(0, config["num_levels"])) - empty_levels
+            obs_to_render = []
+            if len(non_empty_levels) >= 10:
+                levels_to_render = random.sample(non_empty_levels, 10)
+                for l in levels_to_render:
+                    states_to_render = np.random.randint(0, len(start_states_by_level[l]), size=10)
+                    for s in states_to_render:
+                        obs_to_render.append(start_states_by_level[l][s])
+                obs_to_render = torch.stack(obs_to_render)
+                img = render_obs((obs_to_render*255).to(torch.uint8), 100)
+                wandb.log({"starting_states_examples": wandb.Image(img)})
+
 
         # Statistics
         if j % config["log_interval"] == 0:
@@ -220,8 +207,6 @@ def main(config):
             logger.logkv("train/time_per_epoch", time_per_epoch)
             for key, val in train_statistics.items():
                 logger.logkv("train/{}".format(key), val)
-            for key, val in pure_train_statistics.items():
-                logger.logkv("pure_train/{}".format(key), val)
 
             # Fetch reward normalizing variables
             norm_infos = envs.normalization_infos()
@@ -257,14 +242,14 @@ def main(config):
             for key, val in train_value_statistics.items():
                 logger.logkv("train/{}".format(key), val) 
 
-            # Evaluate pure actor-critic on train environments
+            # Evaluate pure exploration start on train environments
             rendering = False
-            if (j // config["log_interval"]) % 3 == 0:
-                # only render every third eval
+            if (j // config["log_interval"]) % 24 == 0:
+                # only render every 24 eval
                 rendering = config['render_pure_eval']
-            render_filename = os.path.join(config["output_dir"], f"pure_eval_{log_file}_{int(total_num_steps / 100_000)}.gif")
-            pure_train_eval_statistics, pure_train_value_statistics = evaluate(
-                config, pure_actor_critic, device, test_envs=False, norm_infos=norm_infos, rendering=rendering, render_filename=render_filename,
+            render_filename = os.path.join(config["output_dir"], f"pure_start_eval_{log_file}_{int(total_num_steps / 100_000)}.gif")
+            pure_train_eval_statistics, _ = evaluate_pure_start(
+                config, actor_critic, pure_actor_critic, device, rendering=rendering, render_filename=render_filename,
             )
             pure_train_episode_rewards = pure_train_eval_statistics["episode_rewards"]
             pure_train_episode_steps = pure_train_eval_statistics["episode_steps"]
@@ -275,9 +260,6 @@ def main(config):
             logger.logkv("pure_train/mean_episode_step", np.mean(pure_train_episode_steps))
             logger.logkv("pure_train/med_episode_step", np.median(pure_train_episode_steps))
             logger.logkv("pure_train/std_episode_step", np.std(pure_train_episode_steps))
-
-            for key, val in pure_train_value_statistics.items():
-                logger.logkv("pure_train/{}".format(key), val) 
 
             # Evaluate actor-critic on test environments
             test_eval_statistics, *_ = evaluate(
@@ -388,7 +370,11 @@ if __name__ == "__main__":
 
     # Load config
     if DEBUG:
-        config_file = open("configs/{}.yaml".format('dcpg'), "r")     
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--config", type=str, required=True)
+        args = parser.parse_args()
+        # config_file = open("configs/{}.yaml".format('ppo'), "r")   
+        config_file = open(args.config, "r")    
     else:
         # config_file = open("configs/{}.yaml".format(args.exp_name), "r")    
         config_file = open(args.config, "r")   
@@ -396,14 +382,15 @@ if __name__ == "__main__":
 
     # Update config
     if DEBUG:
-        config["exp_name"] = 'dcpg'
-        config["env_name"] = 'bigfish'
+        config["exp_name"] = 'ppo'
+        config["env_name"] = 'maze'
         config["seed"] = 1
         config["debug"] = False
-        config["project_name"] = "debugging"
+        # config["project_name"] = "debugging"
         config["log_dir"] = config["log_dir"][1:]
         config["output_dir"] = config["output_dir"][1:]
         config["save_dir"] = config["save_dir"][1:]
+        config["wandb_dir"] = config["wandb_dir"][1:]
     else:
         config["exp_name"] = args.exp_name
         config["env_name"] = args.env_name
