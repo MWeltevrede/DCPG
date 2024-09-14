@@ -124,6 +124,118 @@ def evaluate(config, actor_critic, device, test_envs=True, norm_infos=None, rend
     return eval_statistics, value_statistics
 
 
+def evaluate_pure_start(config, actor_critic, pure_actor_critic, device, norm_infos=None, rendering=False, render_filename=""):
+    # Set actor-critic to evaluation mode
+    actor_critic.eval()
+    pure_actor_critic.eval()
+
+    envs = make_envs(
+        num_envs=config["num_eval_episodes"],
+        env_name=config["env_name"],
+        num_levels=config["num_levels"],
+        start_level=config["start_level"],
+        distribution_mode=config["distribution_mode"],
+        normalize_reward=False,
+        device=device,
+    )
+
+    # Initialize environments
+    obs = envs.reset()
+    pure_masks = torch.ones(config["num_eval_episodes"], 1, device=device)
+    pure_recurrent_hidden_states = torch.zeros(config["num_eval_episodes"], pure_actor_critic.recurrent_hidden_state_size, device=device)
+    pure_expl_steps_per_env = np.random.randint(0, config["num_pure_expl_steps"]+1 , size=config["num_eval_episodes"])
+    episode_steps = np.zeros(config["num_eval_episodes"])
+
+    if rendering:
+        images = []
+
+
+    # Sample episodes
+    episode_rewards = []
+    episode_steps_log = []
+    finished = torch.zeros(obs.size(0))
+
+    # Sample episodes
+    count = 0
+    while not torch.all(finished):
+        # Sample action
+        pure_expl_inds = episode_steps < pure_expl_steps_per_env
+        normal_inds = episode_steps >= pure_expl_steps_per_env
+
+        with torch.no_grad():
+            if sum(normal_inds) > 0:
+                normal_action, _, _ = actor_critic.act(obs[normal_inds])
+                if sum(pure_expl_inds) > 0:
+                    _, pure_action, _, _, pure_recurrent_hidden_states[pure_expl_inds] = pure_actor_critic.act(
+                        obs[pure_expl_inds],
+                        pure_recurrent_hidden_states[pure_expl_inds],
+                        pure_masks[pure_expl_inds]
+                        )
+                else:
+                    # cannot call act with empty observation tensor
+                    # so create our own empty results
+                    pure_action = torch.zeros((0, *normal_action.shape[1:]), dtype=normal_action.dtype, device=normal_action.device)
+            else:
+                _, pure_action, _, _, pure_recurrent_hidden_states[pure_expl_inds] = pure_actor_critic.act(
+                    obs[pure_expl_inds],
+                    pure_recurrent_hidden_states[pure_expl_inds],
+                    pure_masks[pure_expl_inds]
+                    )
+                # cannot call act with empty observation tensor
+                # so create our own empty results
+                normal_action = torch.zeros((0, *pure_action.shape[1:]), dtype=pure_action.dtype, device=pure_action.device)
+        
+        action = torch.zeros((config["num_eval_episodes"], 1), dtype=normal_action.dtype, device=device)
+        action[normal_inds] = normal_action
+        action[pure_expl_inds] = pure_action
+
+        if rendering and count < 200:
+            # render the first 200 steps
+            img = render_obs((obs*255).to(torch.uint8), config["num_eval_episodes"])
+            images.append(img)
+
+        # Interact with environment
+        next_obs, reward, done, infos = envs.step(action)
+
+        pure_masks = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in done]).to(device)
+        # Set mask to 0 for the last pure exploration step of the episode
+        pure_masks[episode_steps == pure_expl_steps_per_env-1] = torch.FloatTensor([0.0]).to(device)
+
+        reward = reward.to(device)
+
+        # update episodic step count
+        episode_steps += 1
+        episode_steps[done] = 0
+        count += 1
+        
+        # sample new number of pure exploration steps to perform
+        pure_expl_steps_per_env[done] = np.random.randint(0, config["num_pure_expl_steps"]+1 , size=sum(done))
+
+        # Track episode info
+        for i, info in enumerate(infos):
+            if "episode" in info and not finished[i]:
+                episode_rewards.append(info["episode"]["r"])
+                episode_steps_log.append(episode_steps[i])
+                finished[i] = 1
+
+        obs = next_obs
+
+    # Close environment
+    envs.close()
+
+    if rendering:
+        imageio.mimsave(render_filename, [np.array(img) for i, img in enumerate(images) if i%1 == 0], duration=200)
+        wandb.log({"pure_start_eval": wandb.Video(np.array(images).transpose((0,3,1,2)), fps=10)})
+
+    # Statistics
+    eval_statistics = {
+        "episode_rewards": episode_rewards,
+        "episode_steps": episode_steps,
+    }
+
+    return eval_statistics, {}
+
+
 def resize_image(image_matrix, nh, nw):
     image_size = image_matrix.shape
     oh = image_size[0]
