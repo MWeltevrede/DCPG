@@ -20,7 +20,7 @@ from dcpg.storages import RolloutStorage
 from dcpg.rnd import RandomNetworkDistillationState, RandomNetworkDistillationStateAction
 from test import evaluate, evaluate_pure_start, render_obs
 
-from expgen.PPO_maxEnt_LEEP.model import Policy, ImpalaModel
+from expgen.model import Policy, ImpalaModel
 
 DEBUG = False
 
@@ -95,7 +95,7 @@ def main(config):
     )
     pure_actor_critic.to(device)
 
-    pure_actor_critic_weights = torch.load(f"models/{config['env_name']}-expgen.pt")
+    pure_actor_critic_weights = torch.load(f"/expgen/{config['env_name']}-expgen.pt")
     pure_actor_critic.load_state_dict(pure_actor_critic_weights['state_dict'])
     print("\nPure Exploration Actor-Critic Network:", pure_actor_critic)
 

@@ -8,7 +8,7 @@ from dcpg.models import PPOModel
 from dcpg.storages import RolloutStorage
 from dcpg.rnd import RandomNetworkDistillationState, RandomNetworkDistillationStateAction
 
-from expgen.PPO_maxEnt_LEEP.model import Policy
+from expgen.model import Policy
 
 
 def sample_episodes(
